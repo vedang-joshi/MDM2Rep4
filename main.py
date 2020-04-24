@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 
 
 # Read in login file to connect up with Twitter API
-loginFile = pd.read_csv("Login.csv")
+loginFile = pd.read_csv("Login_sample.csv")
 
 # Get Twitter API credentials
 consumerKey = loginFile["key"][0]
