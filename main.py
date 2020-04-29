@@ -22,7 +22,9 @@ from collections import defaultdict
 from gensim import matutils, models
 from gensim.models import CoherenceModel
 from sklearn.feature_extraction.text import CountVectorizer
+from sklearn_crfsuite import CRF, metrics
 from nltk import word_tokenize, pos_tag
+from nltk.tag.util import untag
 from nltk.corpus import stopwords
 from pprint import pprint
 import pandas as pd
@@ -31,7 +33,7 @@ import matplotlib.pyplot as plt
 
 
 # Read in login file to connect up with Twitter API
-loginFile = pd.read_csv("Login_sample.csv")
+loginFile = pd.read_csv("Login.csv")
 
 # Get Twitter API credentials
 consumerKey = loginFile["key"][0]
@@ -54,7 +56,7 @@ def coherence_funct(twitterHandle, apiObject):
     print(twitterHandle)
     print("")
     # Extract 100 tweets from the twitter user
-    tweetExtract = apiObject.user_timeline(screen_name=twitterHandle, count=1500, lang="en", tweet_mode="extended")
+    tweetExtract = apiObject.user_timeline(screen_name=twitterHandle, count=70, lang="en", tweet_mode="extended")
 
     # Create a dataframe with a column called Tweets
     tweetList = []
@@ -131,32 +133,82 @@ def coherence_funct(twitterHandle, apiObject):
     dataframeToStringNospaces = " ".join(dataframeToString.split())
 
     # separate into noun phrases, adjectives, verb phrases etc.
-    tokenizedSentence = nltk.sent_tokenize(dataframeToStringNospaces)
+    sentenceList = nltk.sent_tokenize(dataframeToStringNospaces)
+    for sentence in sentenceList:
+        tokenizedSentences = nltk.word_tokenize(str(sentence))
 
-    nounList = []
-    verbList = []
-    adjectiveList = []
-    adverbList = []
-    for sentence in tokenizedSentence:
-        for word,pos in nltk.pos_tag(nltk.word_tokenize(str(sentence))):
-            if (pos == 'NN' or pos == 'NNP' or pos == 'NNS' or pos == 'NNPS'):
-                nounList.append(word)
-            elif (pos == 'VB' or pos == 'VBD' or pos == 'VBG' or pos == 'VBN' or pos == 'VBP' or pos == 'VBZ'):
-                verbList.append(word)
-            elif (pos == 'JJ' or pos == 'JJR' or pos == 'JJS'):
-                adjectiveList.append(word)
-            elif (pos == 'RB' or pos == 'RBR' or pos == 'RBS'):
-                adverbList.append(word)
+        # Get the tagged sentences from the pre tagged Penn Treebank corpus in NLTK's directory.
 
-    print("")
-    print("Noun Phrase List: ", nounList)
-    print("")
-    print("Verb Phrase List: ", verbList)
-    print("")
-    print("Adjectives List: ", adjectiveList)
-    print("")
-    print("Adverb List: ", adverbList)
-    print("")
+        taggedSentencesFromCorpus = nltk.corpus.treebank.tagged_sents()
+
+        # Please refer to https://nlpforhackers.io/training-pos-tagger/ for the feature extraction function
+        def feature_extraction_function(word, index):
+            return {
+                # Check for word itself
+                'word': word[index],
+                'is_first': index == 0,
+                'is_last': index == len(word) - 1,
+                'is_capitalized': word[index][0].upper() == word[index][0],
+                'is_all_caps': word[index].upper() == word[index],
+                'is_all_lower': word[index].lower() == word[index],
+                # Indicates prefixes to words like using 'a' in 'ammoral' to show 'not moral'
+                'prefix-1': word[index][0],
+                # Indicates prefixes to words like using 'un' in 'unhappy' to show 'not happy'
+                'prefix-2': word[index][:2],
+                # Indicates prefixes to words like using 'dis' in 'disagree' to show 'not agree'
+                'prefix-3': word[index][:3],
+                # Indicates plurality to words like using 's' in 'bags' to show 'multiple bags'
+                'suffix-1': word[index][-1],
+                # Indicates past tense verbs eg. ending in 'ed'
+                'suffix-2': word[index][-2:],
+                # Indicates present participle verbs eg. ending in 'ing'
+                'suffix-3': word[index][-3:],
+                # Check for previous word and next word
+                'previous_word': '' if index == 0 else word[index - 1],
+                'next_word': '' if index == len(word) - 1 else word[index + 1],
+                # Check for sub-string '-'
+                'has_hyphen': '-' in word[index],
+                'is_numeric': word[index].isdigit(),
+                # Check if there are capital characters inside the string
+                'capitals_inside': word[index][1:].lower() != word[index][1:]
+            }
+
+        # Split the dataset: 75% of the tagged sentences will be used for training and the remaining 25% will
+        # be used for testing
+        partitionText = int(0.75 * len(taggedSentencesFromCorpus))
+        trainingSentences = taggedSentencesFromCorpus[:partitionText]  # From start to the partition
+        testingSentences = taggedSentencesFromCorpus[
+                           partitionText:]  # From partition to the end of the tagged sentences
+
+        def pass_to_dataframe(taggedSentences):
+            wordList = []   # X
+            tagList = []    # Y
+
+            for tagged in taggedSentences:
+                wordList.append([feature_extraction_function(untag(tagged), index) for index in range(len(tagged))])
+                tagList.append([tag for _, tag in tagged])
+
+            return wordList, tagList
+
+        # Each row in the dataframe is sequencial as CRF learns sequences - Unlike simple markov models which do not recall
+        # sequences
+        wordsTrain, tagsTrain = pass_to_dataframe(trainingSentences)
+        wordsTest, tagsTest = pass_to_dataframe(testingSentences)
+
+        # Use a CRFSuite model, and fit the training data to the model.
+        model = CRF()
+        # Fit the model to the trained words and corresponding tags
+        model.fit(wordsTrain, tagsTrain)
+
+        def position_tagger(sentence):
+            featureWords = [feature_extraction_function(sentence, index) for index in range(len(sentence))]
+            return list(zip(sentence, model.predict([featureWords])[0]))
+
+        print(position_tagger(tokenizedSentences))
+
+        tagsPrediction = model.predict(wordsTest)
+        # Test for accuracy between the tested tags and the predicted tags
+        accuracyModel = metrics.flat_accuracy_score(tagsTest, tagsPrediction)
 
     # Topic Modelling: Assign topics to the subject talked about. Focusing on Noun/Noun Phrases as most of the meaning
     #                                                            of the sentence can be found in the noun phrases used.
@@ -215,7 +267,7 @@ def coherence_funct(twitterHandle, apiObject):
         for num_topics in range(start, limit, step):
             modelTopic=models.LdaModel(corpus=corpus, id2word=dictionary, num_topics=num_topics,
                                        passes=10, alpha='auto')
-            # If required the line below, prints all the topics found.
+            # If required, the line below, prints all the topics found.
             #pprint(modelTopic.print_topics())
             coherenceModel = CoherenceModel(model=modelTopic, corpus=corpus, dictionary=dictionary, coherence='u_mass')
             coherenceValues.append(coherenceModel.get_coherence())
@@ -289,15 +341,18 @@ def coherence_funct(twitterHandle, apiObject):
         generatedSentence += '.'
         return (generatedSentence)
 
+    '''
     tweetDict = markov_chain(dataframeToStringNospaces)
-
+    
     print("Text generation using simple Markov chains")
     # Range is number of tweets generated
     for _ in range(20):
         sentGen = generate_tweets(tweetDict)
         print("Generated tweet: ", sentGen)
 
-    return maxTopics
+    '''
+
+    return maxTopics, accuracyModel
 
 
 ###################### Main Execution #########################################################
@@ -313,12 +368,15 @@ for i in twitterHandles:
 
 # Get the topic number for the LDA model with the highest coherence value as calculated in the coherence_funct above.
 for i in handleList:
-    maxTopic = coherence_funct(i, apiObject)
+    maxTopic, modelAccuracy = coherence_funct(i, apiObject)
     topicNumList.append(maxTopic)
 
+print("The accuracy of the CRF modelling is: ",modelAccuracy)
+
+
 # Plot the twitter handle list against the number of topics list
-plt.plot(handleList, topicNumList, 'r-')
-plt.title("Topic count for specific Twitter users")
+plt.plot(handleList, topicNumList, 'ro')
+plt.title("Topic count for Twitter users: Top 20 most followed British MPs")
 plt.xlabel("Twitter handles")
 plt.ylabel("Number of topics in tweets")
 plt.xticks(rotation=90, ha='left')
